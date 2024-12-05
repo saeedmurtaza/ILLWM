@@ -1,1 +1,257 @@
+#LSTM Code for test
+
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import warnings
+import pickle
+from itertools import product
+warnings.filterwarnings('ignore')
+
+# Set the seed for reproducibility
+SEED = 42
+
+# Python random module
+import random
+random.seed(SEED)
+
+# NumPy random generator
+np.random.seed(SEED)
+
+# PyTorch random generators
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+#torch.cuda.manual_seed_all(SEED)  # If using multiple GPUs
+
+# Ensure deterministic behavior in cuDNN (may slow down training)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+
+# Load the dataset
+file_path = r"D:\Reproducing the values\MR_at_test\Datasets\MR_40\505_c1_mcar_40.csv"
+data = pd.read_csv(file_path)
+
+# Convert the 'datetime' feature to datetime object with the correct format
+data['datetime'] = pd.to_datetime(data['datetime'], format='%d/%m/%Y %H:%M')
+
+# Handle missing values in 'value' column by replacing empty strings with NaN
+data['value'] = pd.to_numeric(data['value'], errors='coerce')
+
+# Encode categorical features
+label_encoders = {}
+for column in ['weekday', 'hour','is_weekend', 'is_working_hour', 'season']:
+    le = LabelEncoder()
+    data[column] = le.fit_transform(data[column])
+    label_encoders[column] = le
+
+# Normalize the 'value' column
+scaler = StandardScaler()
+data['value_normalized'] = scaler.fit_transform(data[['value']])
+
+# Separate rows with missing values
+missing_data = data[data['value'].isna()]
+data_train = data.dropna()
+
+# Split the dataset into features and labels
+features = data_train.drop(columns=['value', 'value_normalized', 'datetime', 'meter_no'])
+labels = data_train['value_normalized']
+
+# Split the dataset into training and test sets
+X_train, X_test, y_train, y_test = train_test_split(features, labels, test_size=0.2, random_state=42)
+
+# Convert data to PyTorch tensors
+X_train = torch.tensor(X_train.values, dtype=torch.float32)
+y_train = torch.tensor(y_train.values, dtype=torch.float32).unsqueeze(1)
+X_test = torch.tensor(X_test.values, dtype=torch.float32)
+y_test = torch.tensor(y_test.values, dtype=torch.float32).unsqueeze(1)
+
+# Define the LSTM Model
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers):
+        super(LSTMModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+
+        out, _ = self.lstm(x.unsqueeze(1), (h0, c0))  # Reshape input to (batch_size, sequence_length, input_size)
+        out = self.fc(out[:, -1, :])
+        return out
+
+# Training Loop for LSTM Model with Early Stopping
+def train(model, train_loader, val_loader, optimizer, epochs, patience):
+    model.train()
+    train_losses = []
+    val_losses = []
+    best_val_loss = float('inf')
+    patience_counter = 0
+
+    for epoch in range(epochs):
+        total_loss = 0
+        model.train()
+        for inputs, labels in train_loader:
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = nn.MSELoss()(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        avg_train_loss = total_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+
+        # Validation phase
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for inputs, labels in val_loader:
+                outputs = model(inputs)
+                loss = nn.MSELoss()(outputs, labels)
+                total_val_loss += loss.item()
+        avg_val_loss = total_val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+
+        print(f'Epoch {epoch+1}, Train Loss: {avg_train_loss}, Val Loss: {avg_val_loss}')
+
+        # Early stopping check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early stopping triggered")
+                break
+
+    return train_losses, val_losses
+
+# Prepare the dataset for training and validation
+train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
+val_dataset = torch.utils.data.TensorDataset(X_test, y_test)
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+# Initialize the model, optimizer, and loss function
+input_size = X_train.shape[1]
+hidden_size = 64
+num_layers = 4
+epochs = 150
+patience = 20  # Number of epochs to wait for improvement
+
+# Grid search for hyperparameter tuning for LSTM
+param_grid = {
+    'hidden_size': [32,64],    #[32, 64, 128]
+    'num_layers': [2,4],     #[2, 3, 4],
+    'learning_rate': [0.001, 0.0001],  #[0.001, 0.0001],
+    'batch_size': [32,64]           #[32, 64]
+}
+
+best_val_loss = float('inf')
+best_params = {}
+
+for hidden_size, num_layers, lr, batch_size in product(param_grid['hidden_size'], param_grid['num_layers'], param_grid['learning_rate'], param_grid['batch_size']):
+    print(f"Training with hidden_size={hidden_size}, num_layers={num_layers}, learning_rate={lr}, batch_size={batch_size}")
+    model = LSTMModel(input_size, hidden_size, num_layers)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # Prepare the dataset for training and validation
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    train_losses, val_losses = train(model, train_loader, val_loader, optimizer, epochs, patience)
+
+    if min(val_losses) < best_val_loss:
+        best_val_loss = min(val_losses)
+        best_params = {
+            'hidden_size': hidden_size,
+            'num_layers': num_layers,
+            'learning_rate': lr,
+            'batch_size': batch_size
+        }
+
+print(f"Best params: {best_params}")
+
+# Train the best model with the best parameters
+best_hidden_size = best_params['hidden_size']
+best_num_layers = best_params['num_layers']
+best_learning_rate = best_params['learning_rate']
+best_batch_size = best_params['batch_size']
+
+model = LSTMModel(input_size, best_hidden_size, best_num_layers)
+optimizer = optim.Adam(model.parameters(), lr=best_learning_rate)
+
+# Prepare the dataset for training and validation with the best batch size
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=best_batch_size, shuffle=True)
+val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=best_batch_size, shuffle=False)
+
+train_losses, val_losses = train(model, train_loader, val_loader, optimizer, epochs, patience)
+
+sns.set()
+plt.figure(figsize=(6, 4))
+plt.plot(train_losses, label="Training loss")
+plt.plot(val_losses, label="Validation loss")
+plt.legend(loc="upper right")
+plt.xlabel("Training steps")
+plt.title("Training and Validation Loss")
+plt.savefig(r"D:\Reproducing the values\MR_at_test\Datasets\MR_40\505_LSTM_Seoul_40a_Plot.png")
+plt.show()
+
+# Impute missing values in the dataset
+missing_features = missing_data.drop(columns=['value', 'value_normalized', 'datetime', 'meter_no'])
+missing_features = torch.tensor(missing_features.values, dtype=torch.float32)
+
+model.eval()
+with torch.no_grad():
+    imputed_values = model(missing_features).numpy()
+
+# Scale back the imputed values to the original scale
+imputed_values = scaler.inverse_transform(imputed_values)
+
+# Create a new column '501_LNN_Seoul_20' and fill it with the original 'value' column
+data['505_LSTM_Seoul_40'] = data['value']
+
+# Update the '501_LNN_Seoul_20' column with the imputed values at the missing indices
+data.loc[missing_data.index, '505_LSTM_Seoul_40'] = imputed_values[:, 0]
+
+# Save the updated dataset to a CSV file
+output_path = r"D:\Reproducing the values\MR_at_test\Datasets\MR_40\505_b1_mcar_40_imp.csv"
+data.to_csv(output_path, index=False)
+
+# Compute the RMSE score on the test set
+model.eval()
+with torch.no_grad():
+    test_predictions = model(X_test).numpy()
+
+# Scale back the test predictions to the original scale
+y_test_inverse = scaler.inverse_transform(y_test.cpu())
+test_predictions_inverse = scaler.inverse_transform(test_predictions)
+
+# Plot for after training
+plt.figure(figsize=(6, 4))
+plt.plot(y_test_inverse, label="Target output")
+plt.plot(test_predictions_inverse[:, 0], label="LSTM output", linestyle="dashed")
+plt.legend(loc="upper right")
+plt.title("After Training")
+plt.savefig(r"D:\Reproducing the values\MR_at_test\Datasets\MR_40\505_LSTM_Seoul_40c_Plot.png")
+plt.show()
+
+# Compute RMSE
+rmse = np.sqrt(mean_squared_error(y_test_inverse, test_predictions_inverse[:, 0]))
+print(f'RMSE: {rmse}')
+
+# Calculate the correlation between 'ytrue' and imputed 'value'
+correlation = data['ytrue'].corr(data['505_LSTM_Seoul_40'])
+print(f"Correlation: {correlation}")
 
